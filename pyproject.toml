@@ -1,13 +1,16 @@
 [project]
 name = "launchops"
 version = "0.1.0"
-description = "FastAPI service for launch readiness and operational health checks"
+description = "Self-service environment and release control plane for DevOps learning"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.141.1",
     "uvicorn>=0.52.4",
     "httpx>=0.28.1",
+    "sqlalchemy>=2.0.45",
+    "psycopg[binary]>=3.2.13",
+    "alembic>=1.18.1",
 ]
 
 [project.optional-dependencies]
