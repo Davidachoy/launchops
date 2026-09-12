@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.mappers import environment_create_to_row, row_to_environment, row_to_event
@@ -18,6 +19,32 @@ app = FastAPI(title="LaunchOps")
 
 def _payload_fingerprint(payload: EnvironmentCreate) -> str:
     return payload.model_dump_json()
+
+
+def _environment_for_idempotency_key(
+    db: Session,
+    key: str,
+    fingerprint: str,
+) -> Environment:
+    """Resolve an existing idempotency record into an Environment or raise 409."""
+    existing = db.get(IdempotencyRecord, key)
+    if existing is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency-Key conflict could not be resolved",
+        )
+    if existing.request_fingerprint != fingerprint:
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency-Key reused with a different payload",
+        )
+    row = db.get(EnvironmentRow, existing.environment_id)
+    if row is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency-Key refers to a missing environment",
+        )
+    return row_to_environment(row)
 
 
 @app.get("/health")
@@ -45,19 +72,9 @@ def create_environment(
 
         existing = db.get(IdempotencyRecord, key)
         if existing is not None:
-            if existing.request_fingerprint != fingerprint:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Idempotency-Key reused with a different payload",
-                )
-            row = db.get(EnvironmentRow, existing.environment_id)
-            if row is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Idempotency-Key refers to a missing environment",
-                )
+            environment = _environment_for_idempotency_key(db, key, fingerprint)
             response.status_code = 200
-            return row_to_environment(row)
+            return environment
 
     created_at = datetime.now(timezone.utc)
     environment_id = f"env-{uuid4()}"
@@ -79,9 +96,18 @@ def create_environment(
             )
         )
 
-    db.commit()
-    db.refresh(row)
+    try:
+        db.commit()
+    except IntegrityError:
+        # Concurrent create with the same Idempotency-Key: loser retries as a read.
+        db.rollback()
+        if key is None:
+            raise
+        environment = _environment_for_idempotency_key(db, key, fingerprint)
+        response.status_code = 200
+        return environment
 
+    db.refresh(row)
     response.status_code = 201
     return row_to_environment(row)
 

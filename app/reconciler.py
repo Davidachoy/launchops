@@ -18,6 +18,7 @@ def expire_if_needed(
     now: datetime,
     correlation_id: str,
 ) -> EnvironmentEvent | None:
+    """Apply TTL against the persisted row. Does not commit."""
     if row.desired_state != DesiredState.ACTIVE.value:
         return None
     if row.expires_at > now:
@@ -130,28 +131,31 @@ def _reconcile_deleted(
 
 def reconcile_environment(
     db: Session,
-    row: EnvironmentRow,
+    environment_id: str,
     correlation_id: str,
     now: datetime | None = None,
 ) -> EnvironmentEvent | None:
-    """Apply at most one status transition toward the current desired state."""
+    """Load a persisted environment and apply at most one status transition.
+
+    status update + EnvironmentEvent INSERT happen in one transaction:
+    commit exactly once at the end, or roll back if anything fails.
+    """
     current_time = now if now is not None else datetime.now(timezone.utc)
 
-    expired_event = expire_if_needed(db, row, current_time, correlation_id)
-    if expired_event is not None:
+    try:
+        row = db.get(EnvironmentRow, environment_id)
+        if row is None:
+            raise ValueError(f"environment not found: {environment_id}")
+
+        event = expire_if_needed(db, row, current_time, correlation_id)
+        if event is None:
+            if row.desired_state == DesiredState.ACTIVE.value:
+                event = _reconcile_active(db, row, correlation_id)
+            elif row.desired_state == DesiredState.DELETED.value:
+                event = _reconcile_deleted(db, row, correlation_id)
+
         db.commit()
-        return expired_event
-
-    if row.desired_state == DesiredState.ACTIVE.value:
-        event = _reconcile_active(db, row, correlation_id)
-        if event is not None:
-            db.commit()
         return event
-
-    if row.desired_state == DesiredState.DELETED.value:
-        event = _reconcile_deleted(db, row, correlation_id)
-        if event is not None:
-            db.commit()
-        return event
-
-    return None
+    except Exception:
+        db.rollback()
+        raise

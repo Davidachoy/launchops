@@ -1,4 +1,5 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
@@ -207,11 +208,9 @@ def test_list_events_returns_ordered_history(client: TestClient) -> None:
     env_id = created["id"]
 
     with SessionLocal() as db:
-        row = db.get(EnvironmentRow, env_id)
-        assert row is not None
-        reconcile_environment(db, row, correlation_id=correlation_id)
-        reconcile_environment(db, row, correlation_id=correlation_id)
-        reconcile_environment(db, row, correlation_id=correlation_id)
+        reconcile_environment(db, env_id, correlation_id=correlation_id)
+        reconcile_environment(db, env_id, correlation_id=correlation_id)
+        reconcile_environment(db, env_id, correlation_id=correlation_id)
 
     response = client.get(f"/environments/{env_id}/events")
 
@@ -274,3 +273,126 @@ def test_create_with_same_idempotency_key_and_different_payload_conflicts(
         row = db.get(EnvironmentRow, first.json()["id"])
         assert row is not None
         assert row.repo == "demo-app"
+
+
+def test_create_rejects_blank_idempotency_key(client: TestClient) -> None:
+    response = client.post(
+        "/environments",
+        json=CREATE_PAYLOAD,
+        headers={"Idempotency-Key": "   "},
+    )
+
+    assert response.status_code == 422
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(EnvironmentRow)) == 0
+        assert db.scalar(select(func.count()).select_from(IdempotencyRecord)) == 0
+
+
+def test_create_without_idempotency_key_allows_distinct_environments(
+    client: TestClient,
+) -> None:
+    first = client.post("/environments", json=CREATE_PAYLOAD)
+    second = client.post("/environments", json=CREATE_PAYLOAD)
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["id"] != second.json()["id"]
+
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(EnvironmentRow)) == 2
+        assert db.scalar(select(func.count()).select_from(IdempotencyRecord)) == 0
+
+
+def test_concurrent_idempotent_creates_persist_single_environment() -> None:
+    """Two racing clients with the same key must leave exactly one env row."""
+    _clear_database()
+    key = "race-idempotency-1"
+    headers = {"Idempotency-Key": key}
+
+    def _create(_: int):
+        with TestClient(app) as client:
+            return client.post("/environments", json=CREATE_PAYLOAD, headers=headers)
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            responses = list(pool.map(_create, range(8)))
+
+        assert all(response.status_code in {200, 201} for response in responses)
+        assert sum(1 for response in responses if response.status_code == 201) >= 1
+        environment_ids = {response.json()["id"] for response in responses}
+        assert len(environment_ids) == 1
+
+        with SessionLocal() as db:
+            assert db.scalar(select(func.count()).select_from(EnvironmentRow)) == 1
+            assert db.scalar(select(func.count()).select_from(IdempotencyRecord)) == 1
+            record = db.get(IdempotencyRecord, key)
+            assert record is not None
+            assert record.environment_id == next(iter(environment_ids))
+    finally:
+        _clear_database()
+
+
+def test_state_survives_app_restart(client: TestClient) -> None:
+    headers = {"Idempotency-Key": "restart-1"}
+    created = client.post("/environments", json=CREATE_PAYLOAD, headers=headers)
+    assert created.status_code == 201
+    env_id = created.json()["id"]
+
+    # New TestClient = fresh process-like boundary; only PostgreSQL retains state.
+    with TestClient(app) as restarted:
+        fetched = restarted.get(f"/environments/{env_id}")
+        assert fetched.status_code == 200
+        assert fetched.json()["id"] == env_id
+        assert fetched.json()["status"] == "REQUESTED"
+
+        replay = restarted.post(
+            "/environments",
+            json=CREATE_PAYLOAD,
+            headers=headers,
+        )
+        assert replay.status_code == 200
+        assert replay.json()["id"] == env_id
+
+        events = restarted.get(f"/environments/{env_id}/events")
+        assert events.status_code == 200
+        assert events.json() == []
+
+
+def test_reconcile_and_ttl_survive_app_restart(client: TestClient) -> None:
+    created = client.post("/environments", json=CREATE_PAYLOAD).json()
+    env_id = created["id"]
+    created_at = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    expires_at = created_at + timedelta(hours=2)
+    now = expires_at
+
+    with SessionLocal() as db:
+        row = db.get(EnvironmentRow, env_id)
+        assert row is not None
+        row.status = EnvironmentStatus.READY.value
+        row.created_at = created_at
+        row.expires_at = expires_at
+        db.commit()
+
+    with TestClient(app) as restarted:
+        with SessionLocal() as db:
+            event = reconcile_environment(
+                db, env_id, correlation_id="corr-restart-ttl", now=now
+            )
+            assert event is not None
+            row = db.get(EnvironmentRow, env_id)
+            assert row is not None
+            assert row.status == EnvironmentStatus.EXPIRED.value
+            assert row.desired_state == "DELETED"
+
+        fetched = restarted.get(f"/environments/{env_id}")
+        assert fetched.status_code == 200
+        assert fetched.json()["status"] == "EXPIRED"
+        assert fetched.json()["desired_state"] == "DELETED"
+
+        events = restarted.get(f"/environments/{env_id}/events")
+        assert events.status_code == 200
+        body = events.json()
+        assert len(body) == 1
+        assert body[0]["from_status"] == "READY"
+        assert body[0]["to_status"] == "EXPIRED"
+        assert body[0]["reason"] == "ttl expired"

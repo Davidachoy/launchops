@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from app.db.mappers import row_to_event
 from app.db.models import Environment as EnvironmentRow
 from app.db.models import EnvironmentEvent as EnvironmentEventRow
-from app.models import EnvironmentStatus
+from app.models import EnvironmentEvent, EnvironmentStatus
 
 VALID_TRANSITIONS: dict[EnvironmentStatus, set[EnvironmentStatus]] = {
     EnvironmentStatus.REQUESTED: {
@@ -38,6 +38,11 @@ def transition_environment(
     reason: str,
     correlation_id: str,
 ) -> EnvironmentEvent:
+    """Update row.status and INSERT environment_events in the same DB transaction.
+
+    Does not commit — the caller (typically the reconciler) owns the transaction
+    boundary so status + event land together or not at all.
+    """
     current_status = EnvironmentStatus(row.status)
     allowed = VALID_TRANSITIONS.get(current_status, set())
     if new_status not in allowed:

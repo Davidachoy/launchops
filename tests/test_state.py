@@ -199,3 +199,39 @@ def test_in_flight_to_deleting_is_allowed(status: EnvironmentStatus) -> None:
         assert row.status == EnvironmentStatus.DELETING.value
         assert event.from_status == status
         assert event.to_status == EnvironmentStatus.DELETING
+
+
+def test_status_and_event_commit_atomically() -> None:
+    with SessionLocal() as db:
+        row = make_row(db, EnvironmentStatus.REQUESTED)
+        transition_environment(
+            db,
+            row,
+            EnvironmentStatus.QUEUED,
+            actor="reconciler",
+            reason="accepted for provisioning",
+            correlation_id="corr-atomic",
+        )
+        db.rollback()
+
+        db.refresh(row)
+        assert row.status == EnvironmentStatus.REQUESTED.value
+        assert list_events(db, row.id) == []
+
+        transition_environment(
+            db,
+            row,
+            EnvironmentStatus.QUEUED,
+            actor="reconciler",
+            reason="accepted for provisioning",
+            correlation_id="corr-atomic",
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        row = db.get(EnvironmentRow, "env-test")
+        assert row is not None
+        assert row.status == EnvironmentStatus.QUEUED.value
+        events = list_events(db, row.id)
+        assert len(events) == 1
+        assert events[0].to_status == EnvironmentStatus.QUEUED.value

@@ -27,10 +27,13 @@ SessionLocal = sessionmaker(
 
 
 def get_db() -> Generator[Session, None, None]:
-    """Yield a DB session and always close it afterward (FastAPI dependency style)."""
+    """Yield a DB session; roll back on error and always close afterward."""
     db = SessionLocal()
     try:
         yield db
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
