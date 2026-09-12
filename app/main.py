@@ -2,16 +2,18 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated
 from uuid import uuid4
 
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
+from app.db.mappers import environment_create_to_row, row_to_environment, row_to_event
+from app.db.models import Environment as EnvironmentRow
+from app.db.models import EnvironmentEvent as EnvironmentEventRow
+from app.db.models import IdempotencyRecord
+from app.db.session import get_db
 from app.models import DesiredState, Environment, EnvironmentCreate, EnvironmentEvent
-from app.state import events_by_environment
 
 app = FastAPI(title="LaunchOps")
-
-environments: dict[str, Environment] = {}
-# Idempotency-Key -> (payload fingerprint, environment id)
-idempotency_records: dict[str, tuple[str, str]] = {}
 
 
 def _payload_fingerprint(payload: EnvironmentCreate) -> str:
@@ -27,9 +29,11 @@ def health() -> dict[str, str]:
 def create_environment(
     payload: EnvironmentCreate,
     response: Response,
+    db: Annotated[Session, Depends(get_db)],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> Environment:
     fingerprint = _payload_fingerprint(payload)
+    key: str | None = None
 
     if idempotency_key is not None:
         key = idempotency_key.strip()
@@ -39,64 +43,91 @@ def create_environment(
                 detail="Idempotency-Key must not be blank",
             )
 
-        existing = idempotency_records.get(key)
+        existing = db.get(IdempotencyRecord, key)
         if existing is not None:
-            stored_fingerprint, environment_id = existing
-            if stored_fingerprint != fingerprint:
+            if existing.request_fingerprint != fingerprint:
                 raise HTTPException(
                     status_code=409,
                     detail="Idempotency-Key reused with a different payload",
                 )
-            environment = environments[environment_id]
+            row = db.get(EnvironmentRow, existing.environment_id)
+            if row is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency-Key refers to a missing environment",
+                )
             response.status_code = 200
-            return environment
+            return row_to_environment(row)
 
     created_at = datetime.now(timezone.utc)
-    environment = Environment(
-        id=f"env-{uuid4()}",
-        owner=payload.owner,
-        repo=payload.repo,
-        runtime=payload.runtime,
-        resources=payload.resources,
-        slo=payload.slo,
-        ttl_hours=payload.ttl_hours,
+    environment_id = f"env-{uuid4()}"
+    row = environment_create_to_row(
+        payload,
+        environment_id=environment_id,
         created_at=created_at,
         expires_at=created_at + timedelta(hours=payload.ttl_hours),
     )
-    environments[environment.id] = environment
+    db.add(row)
 
-    if idempotency_key is not None:
-        idempotency_records[idempotency_key.strip()] = (fingerprint, environment.id)
+    if key is not None:
+        db.add(
+            IdempotencyRecord(
+                idempotency_key=key,
+                request_fingerprint=fingerprint,
+                environment_id=environment_id,
+                created_at=created_at,
+            )
+        )
+
+    db.commit()
+    db.refresh(row)
 
     response.status_code = 201
-    return environment
+    return row_to_environment(row)
 
 
 @app.get("/environments/{environment_id}", response_model=Environment)
-def get_environment(environment_id: str) -> Environment:
-    environment = environments.get(environment_id)
-    if environment is None:
+def get_environment(
+    environment_id: str,
+    db: Annotated[Session, Depends(get_db)],
+) -> Environment:
+    row = db.get(EnvironmentRow, environment_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="Environment not found")
-    return environment
+    return row_to_environment(row)
 
 
 @app.get(
     "/environments/{environment_id}/events",
     response_model=list[EnvironmentEvent],
 )
-def list_environment_events(environment_id: str) -> list[EnvironmentEvent]:
-    if environment_id not in environments:
+def list_environment_events(
+    environment_id: str,
+    db: Annotated[Session, Depends(get_db)],
+) -> list[EnvironmentEvent]:
+    if db.get(EnvironmentRow, environment_id) is None:
         raise HTTPException(status_code=404, detail="Environment not found")
-    return events_by_environment.get(environment_id, [])
+
+    event_rows = db.scalars(
+        select(EnvironmentEventRow)
+        .where(EnvironmentEventRow.environment_id == environment_id)
+        .order_by(EnvironmentEventRow.timestamp, EnvironmentEventRow.id)
+    ).all()
+    return [row_to_event(event_row) for event_row in event_rows]
 
 
 @app.delete("/environments/{environment_id}", response_model=Environment)
-def delete_environment(environment_id: str) -> Environment:
-    environment = environments.get(environment_id)
-    if environment is None:
+def delete_environment(
+    environment_id: str,
+    db: Annotated[Session, Depends(get_db)],
+) -> Environment:
+    row = db.get(EnvironmentRow, environment_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="Environment not found")
-    if environment.desired_state == DesiredState.DELETED:
-        return environment
+    if row.desired_state == DesiredState.DELETED.value:
+        return row_to_environment(row)
 
-    environment.desired_state = DesiredState.DELETED
-    return environment
+    row.desired_state = DesiredState.DELETED.value
+    db.commit()
+    db.refresh(row)
+    return row_to_environment(row)

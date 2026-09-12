@@ -1,4 +1,5 @@
 import os
+from collections.abc import Generator
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -25,7 +26,20 @@ SessionLocal = sessionmaker(
 )
 
 
-def check_connection() -> None:
-    """Open a connection and run SELECT 1. Raises if PostgreSQL is unreachable."""
-    with engine.connect() as connection:
-        connection.execute(text("SELECT 1"))
+def get_db() -> Generator[Session, None, None]:
+    """Yield a DB session and always close it afterward (FastAPI dependency style)."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def check_connection() -> int:
+    """Open a session, run SELECT 1, return 1, then close the session."""
+    db = SessionLocal()
+    try:
+        value = db.execute(text("SELECT 1")).scalar_one()
+        return int(value)
+    finally:
+        db.close()

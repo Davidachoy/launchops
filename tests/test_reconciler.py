@@ -2,11 +2,15 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import delete, select
 
-from app.main import app, environments, idempotency_records
-from app.models import DesiredState, Environment, EnvironmentStatus, ResourceSpec, SLOSpec
+from app.db.models import Environment as EnvironmentRow
+from app.db.models import EnvironmentEvent as EnvironmentEventRow
+from app.db.models import IdempotencyRecord
+from app.db.session import SessionLocal
+from app.main import app
+from app.models import DesiredState, EnvironmentStatus
 from app.reconciler import expire_if_needed, reconcile_environment
-from app.state import events_by_environment
 
 CREATE_PAYLOAD = {
     "owner": "alice",
@@ -18,86 +22,112 @@ CREATE_PAYLOAD = {
 }
 
 
+def _clear_database() -> None:
+    with SessionLocal() as db:
+        db.execute(delete(IdempotencyRecord))
+        db.execute(delete(EnvironmentEventRow))
+        db.execute(delete(EnvironmentRow))
+        db.commit()
+
+
 @pytest.fixture(autouse=True)
-def clear_stores():
-    environments.clear()
-    events_by_environment.clear()
-    idempotency_records.clear()
+def clear_database():
+    _clear_database()
     yield
-    environments.clear()
-    events_by_environment.clear()
-    idempotency_records.clear()
+    _clear_database()
 
 
-def make_environment(
+def make_row(
+    db,
     status: EnvironmentStatus,
     desired_state: DesiredState = DesiredState.ACTIVE,
     *,
     created_at: datetime | None = None,
     expires_at: datetime | None = None,
-) -> Environment:
+    environment_id: str = "env-test",
+) -> EnvironmentRow:
     now = datetime.now(timezone.utc)
     created = created_at or now
     expires = expires_at or (created + timedelta(hours=2))
-    return Environment(
-        id="env-test",
+    row = EnvironmentRow(
+        id=environment_id,
         owner="alice",
         repo="demo-app",
         runtime="python:3.12",
-        resources=ResourceSpec(cpu="500m", memory="512Mi"),
-        slo=SLOSpec(availability=0.99),
+        cpu="500m",
+        memory="512Mi",
+        slo_availability=0.99,
         ttl_hours=2,
-        desired_state=desired_state,
-        status=status,
+        desired_state=desired_state.value,
+        status=status.value,
         created_at=created,
         expires_at=expires,
+        last_error=None,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def list_events(db, environment_id: str) -> list[EnvironmentEventRow]:
+    return list(
+        db.scalars(
+            select(EnvironmentEventRow)
+            .where(EnvironmentEventRow.environment_id == environment_id)
+            .order_by(EnvironmentEventRow.timestamp, EnvironmentEventRow.id)
+        ).all()
     )
 
 
 def test_reconcile_requested_to_queued() -> None:
-    environment = make_environment(EnvironmentStatus.REQUESTED)
+    with SessionLocal() as db:
+        row = make_row(db, EnvironmentStatus.REQUESTED)
 
-    event = reconcile_environment(environment, correlation_id="corr-1")
+        event = reconcile_environment(db, row, correlation_id="corr-1")
 
-    assert environment.status == EnvironmentStatus.QUEUED
-    assert event is not None
-    assert event.from_status == EnvironmentStatus.REQUESTED
-    assert event.to_status == EnvironmentStatus.QUEUED
-    assert len(events_by_environment[environment.id]) == 1
+        assert row.status == EnvironmentStatus.QUEUED.value
+        assert event is not None
+        assert event.from_status == EnvironmentStatus.REQUESTED
+        assert event.to_status == EnvironmentStatus.QUEUED
+        assert len(list_events(db, row.id)) == 1
 
 
 def test_reconcile_queued_to_provisioning() -> None:
-    environment = make_environment(EnvironmentStatus.QUEUED)
+    with SessionLocal() as db:
+        row = make_row(db, EnvironmentStatus.QUEUED)
 
-    event = reconcile_environment(environment, correlation_id="corr-2")
+        event = reconcile_environment(db, row, correlation_id="corr-2")
 
-    assert environment.status == EnvironmentStatus.PROVISIONING
-    assert event is not None
-    assert event.from_status == EnvironmentStatus.QUEUED
-    assert event.to_status == EnvironmentStatus.PROVISIONING
-    assert len(events_by_environment[environment.id]) == 1
+        assert row.status == EnvironmentStatus.PROVISIONING.value
+        assert event is not None
+        assert event.from_status == EnvironmentStatus.QUEUED
+        assert event.to_status == EnvironmentStatus.PROVISIONING
+        assert len(list_events(db, row.id)) == 1
 
 
 def test_reconcile_provisioning_to_ready() -> None:
-    environment = make_environment(EnvironmentStatus.PROVISIONING)
+    with SessionLocal() as db:
+        row = make_row(db, EnvironmentStatus.PROVISIONING)
 
-    event = reconcile_environment(environment, correlation_id="corr-3")
+        event = reconcile_environment(db, row, correlation_id="corr-3")
 
-    assert environment.status == EnvironmentStatus.READY
-    assert event is not None
-    assert event.from_status == EnvironmentStatus.PROVISIONING
-    assert event.to_status == EnvironmentStatus.READY
-    assert len(events_by_environment[environment.id]) == 1
+        assert row.status == EnvironmentStatus.READY.value
+        assert event is not None
+        assert event.from_status == EnvironmentStatus.PROVISIONING
+        assert event.to_status == EnvironmentStatus.READY
+        assert len(list_events(db, row.id)) == 1
 
 
 def test_reconcile_ready_is_noop() -> None:
-    environment = make_environment(EnvironmentStatus.READY)
+    with SessionLocal() as db:
+        row = make_row(db, EnvironmentStatus.READY)
 
-    event = reconcile_environment(environment, correlation_id="corr-4")
+        event = reconcile_environment(db, row, correlation_id="corr-4")
 
-    assert event is None
-    assert environment.status == EnvironmentStatus.READY
-    assert environment.id not in events_by_environment
+        assert event is None
+        assert row.status == EnvironmentStatus.READY.value
+        assert list_events(db, row.id) == []
 
 
 @pytest.mark.parametrize(
@@ -113,81 +143,94 @@ def test_reconcile_ready_is_noop() -> None:
 def test_reconcile_deleted_moves_in_flight_to_deleting(
     status: EnvironmentStatus,
 ) -> None:
-    environment = make_environment(status, desired_state=DesiredState.DELETED)
+    with SessionLocal() as db:
+        row = make_row(db, status, desired_state=DesiredState.DELETED)
 
-    event = reconcile_environment(environment, correlation_id="corr-delete-abort")
+        event = reconcile_environment(db, row, correlation_id="corr-delete-abort")
 
-    assert environment.status == EnvironmentStatus.DELETING
-    assert event is not None
-    assert event.from_status == status
-    assert event.to_status == EnvironmentStatus.DELETING
-    assert len(events_by_environment[environment.id]) == 1
+        assert row.status == EnvironmentStatus.DELETING.value
+        assert event is not None
+        assert event.from_status == status
+        assert event.to_status == EnvironmentStatus.DELETING
+        assert len(list_events(db, row.id)) == 1
 
 
 def test_reconcile_deleted_deleting_to_deleted() -> None:
-    environment = make_environment(
-        EnvironmentStatus.DELETING,
-        desired_state=DesiredState.DELETED,
-    )
+    with SessionLocal() as db:
+        row = make_row(
+            db,
+            EnvironmentStatus.DELETING,
+            desired_state=DesiredState.DELETED,
+        )
 
-    event = reconcile_environment(environment, correlation_id="corr-delete-2")
+        event = reconcile_environment(db, row, correlation_id="corr-delete-2")
 
-    assert environment.status == EnvironmentStatus.DELETED
-    assert event is not None
-    assert event.from_status == EnvironmentStatus.DELETING
-    assert event.to_status == EnvironmentStatus.DELETED
-    assert len(events_by_environment[environment.id]) == 1
+        assert row.status == EnvironmentStatus.DELETED.value
+        assert event is not None
+        assert event.from_status == EnvironmentStatus.DELETING
+        assert event.to_status == EnvironmentStatus.DELETED
+        assert len(list_events(db, row.id)) == 1
 
 
 def test_reconcile_deleted_terminal_is_noop() -> None:
-    environment = make_environment(
-        EnvironmentStatus.DELETED,
-        desired_state=DesiredState.DELETED,
-    )
+    with SessionLocal() as db:
+        row = make_row(
+            db,
+            EnvironmentStatus.DELETED,
+            desired_state=DesiredState.DELETED,
+        )
 
-    event = reconcile_environment(environment, correlation_id="corr-delete-3")
+        event = reconcile_environment(db, row, correlation_id="corr-delete-3")
 
-    assert event is None
-    assert environment.status == EnvironmentStatus.DELETED
-    assert environment.id not in events_by_environment
+        assert event is None
+        assert row.status == EnvironmentStatus.DELETED.value
+        assert list_events(db, row.id) == []
 
 
 def test_expire_if_needed_ready_with_elapsed_ttl() -> None:
     created_at = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     expires_at = created_at + timedelta(hours=2)
     now = expires_at
-    environment = make_environment(
-        EnvironmentStatus.READY,
-        created_at=created_at,
-        expires_at=expires_at,
-    )
 
-    event = expire_if_needed(environment, now=now, correlation_id="corr-expire-1")
+    with SessionLocal() as db:
+        row = make_row(
+            db,
+            EnvironmentStatus.READY,
+            created_at=created_at,
+            expires_at=expires_at,
+        )
 
-    assert environment.status == EnvironmentStatus.EXPIRED
-    assert environment.desired_state == DesiredState.DELETED
-    assert event is not None
-    assert event.from_status == EnvironmentStatus.READY
-    assert event.to_status == EnvironmentStatus.EXPIRED
-    assert len(events_by_environment[environment.id]) == 1
+        event = expire_if_needed(db, row, now=now, correlation_id="corr-expire-1")
+        db.commit()
+
+        assert row.status == EnvironmentStatus.EXPIRED.value
+        assert row.desired_state == DesiredState.DELETED.value
+        assert event is not None
+        assert event.from_status == EnvironmentStatus.READY
+        assert event.to_status == EnvironmentStatus.EXPIRED
+        assert len(list_events(db, row.id)) == 1
 
 
 def test_expire_if_needed_ready_with_remaining_ttl_is_noop() -> None:
     created_at = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     expires_at = created_at + timedelta(hours=2)
     now = created_at + timedelta(hours=1)
-    environment = make_environment(
-        EnvironmentStatus.READY,
-        created_at=created_at,
-        expires_at=expires_at,
-    )
 
-    event = expire_if_needed(environment, now=now, correlation_id="corr-expire-2")
+    with SessionLocal() as db:
+        row = make_row(
+            db,
+            EnvironmentStatus.READY,
+            created_at=created_at,
+            expires_at=expires_at,
+        )
 
-    assert event is None
-    assert environment.status == EnvironmentStatus.READY
-    assert environment.desired_state == DesiredState.ACTIVE
-    assert environment.id not in events_by_environment
+        event = expire_if_needed(db, row, now=now, correlation_id="corr-expire-2")
+        db.commit()
+
+        assert event is None
+        assert row.status == EnvironmentStatus.READY.value
+        assert row.desired_state == DesiredState.ACTIVE.value
+        assert list_events(db, row.id) == []
 
 
 @pytest.mark.parametrize(
@@ -204,20 +247,26 @@ def test_expire_if_needed_pending_operation_with_elapsed_ttl(
     created_at = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     expires_at = created_at + timedelta(hours=2)
     now = expires_at
-    environment = make_environment(
-        status,
-        created_at=created_at,
-        expires_at=expires_at,
-    )
 
-    event = expire_if_needed(environment, now=now, correlation_id="corr-expire-pending")
+    with SessionLocal() as db:
+        row = make_row(
+            db,
+            status,
+            created_at=created_at,
+            expires_at=expires_at,
+        )
 
-    assert environment.status == EnvironmentStatus.DELETING
-    assert environment.desired_state == DesiredState.DELETED
-    assert event is not None
-    assert event.from_status == status
-    assert event.to_status == EnvironmentStatus.DELETING
-    assert len(events_by_environment[environment.id]) == 1
+        event = expire_if_needed(
+            db, row, now=now, correlation_id="corr-expire-pending"
+        )
+        db.commit()
+
+        assert row.status == EnvironmentStatus.DELETING.value
+        assert row.desired_state == DesiredState.DELETED.value
+        assert event is not None
+        assert event.from_status == status
+        assert event.to_status == EnvironmentStatus.DELETING
+        assert len(list_events(db, row.id)) == 1
 
 
 def test_reconcile_expires_ready_then_cleans_up_over_three_calls() -> None:
@@ -225,37 +274,40 @@ def test_reconcile_expires_ready_then_cleans_up_over_three_calls() -> None:
     created_at = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     expires_at = created_at + timedelta(hours=2)
     now = expires_at
-    environment = make_environment(
-        EnvironmentStatus.READY,
-        created_at=created_at,
-        expires_at=expires_at,
-    )
 
-    first = reconcile_environment(environment, correlation_id=correlation_id, now=now)
-    assert first is not None
-    assert environment.status == EnvironmentStatus.EXPIRED
-    assert environment.desired_state == DesiredState.DELETED
+    with SessionLocal() as db:
+        row = make_row(
+            db,
+            EnvironmentStatus.READY,
+            created_at=created_at,
+            expires_at=expires_at,
+        )
 
-    second = reconcile_environment(environment, correlation_id=correlation_id, now=now)
-    assert second is not None
-    assert environment.status == EnvironmentStatus.DELETING
+        first = reconcile_environment(db, row, correlation_id=correlation_id, now=now)
+        assert first is not None
+        assert row.status == EnvironmentStatus.EXPIRED.value
+        assert row.desired_state == DesiredState.DELETED.value
 
-    third = reconcile_environment(environment, correlation_id=correlation_id, now=now)
-    assert third is not None
-    assert environment.status == EnvironmentStatus.DELETED
+        second = reconcile_environment(db, row, correlation_id=correlation_id, now=now)
+        assert second is not None
+        assert row.status == EnvironmentStatus.DELETING.value
 
-    history = [
-        (event.from_status, event.to_status)
-        for event in events_by_environment[environment.id]
-    ]
-    assert history == [
-        (EnvironmentStatus.READY, EnvironmentStatus.EXPIRED),
-        (EnvironmentStatus.EXPIRED, EnvironmentStatus.DELETING),
-        (EnvironmentStatus.DELETING, EnvironmentStatus.DELETED),
-    ]
-    assert {event.correlation_id for event in events_by_environment[environment.id]} == {
-        correlation_id
-    }
+        third = reconcile_environment(db, row, correlation_id=correlation_id, now=now)
+        assert third is not None
+        assert row.status == EnvironmentStatus.DELETED.value
+
+        history = [
+            (EnvironmentStatus(event.from_status), EnvironmentStatus(event.to_status))
+            for event in list_events(db, row.id)
+        ]
+        assert history == [
+            (EnvironmentStatus.READY, EnvironmentStatus.EXPIRED),
+            (EnvironmentStatus.EXPIRED, EnvironmentStatus.DELETING),
+            (EnvironmentStatus.DELETING, EnvironmentStatus.DELETED),
+        ]
+        assert {event.correlation_id for event in list_events(db, row.id)} == {
+            correlation_id
+        }
 
 
 def test_create_then_three_reconciles_reach_ready() -> None:
@@ -267,19 +319,24 @@ def test_create_then_three_reconciles_reach_ready() -> None:
         env_id = created.json()["id"]
         assert created.json()["status"] == "REQUESTED"
 
-        environment = environments[env_id]
+    with SessionLocal() as db:
+        row = db.get(EnvironmentRow, env_id)
+        assert row is not None
 
-        reconcile_environment(environment, correlation_id=correlation_id)
-        assert environment.status == EnvironmentStatus.QUEUED
+        reconcile_environment(db, row, correlation_id=correlation_id)
+        assert row.status == EnvironmentStatus.QUEUED.value
 
-        reconcile_environment(environment, correlation_id=correlation_id)
-        assert environment.status == EnvironmentStatus.PROVISIONING
+        reconcile_environment(db, row, correlation_id=correlation_id)
+        assert row.status == EnvironmentStatus.PROVISIONING.value
 
-        reconcile_environment(environment, correlation_id=correlation_id)
-        assert environment.status == EnvironmentStatus.READY
+        reconcile_environment(db, row, correlation_id=correlation_id)
+        assert row.status == EnvironmentStatus.READY.value
 
-        events = events_by_environment[env_id]
-        history = [(event.from_status, event.to_status) for event in events]
+        events = list_events(db, env_id)
+        history = [
+            (EnvironmentStatus(event.from_status), EnvironmentStatus(event.to_status))
+            for event in events
+        ]
         assert history == [
             (EnvironmentStatus.REQUESTED, EnvironmentStatus.QUEUED),
             (EnvironmentStatus.QUEUED, EnvironmentStatus.PROVISIONING),
